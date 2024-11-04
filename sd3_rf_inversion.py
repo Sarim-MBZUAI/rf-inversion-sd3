@@ -146,6 +146,7 @@ def interpolated_inversion(
     latents,
     gamma,
     DTYPE,
+    prompt = "",
     num_steps=28,
     seed=42
 ):
@@ -168,9 +169,9 @@ def interpolated_inversion(
         pooled_prompt_embeds,
         negative_pooled_prompt_embeds
     ) = pipeline.encode_prompt( # null text
-        prompt="", 
-        prompt_2="",
-        prompt_3="",
+        prompt=prompt, 
+        prompt_2=prompt,
+        prompt_3=prompt,
     )
 
     # generate gaussain noise with seed
@@ -224,8 +225,9 @@ def main():
     parser.add_argument('--guidance_scale', type=float, default=3.5, help='Guidance scale for interpolated_denoise')    
     parser.add_argument('--num_steps', type=int, default=28, help='Number of steps for timesteps')
     parser.add_argument('--seed', type=int, default=42, help='seed for generation')
-    parser.add_argument('--gamma', type=float, default=0.5, help='Gamma parameter for interpolated_inversion')
+    parser.add_argument('--gamma', type=float, default=0.5, help='Gamma parameter for interpolated_inversion, describe how much influent of the source image 0.0 is not influence at all while 1.0 is exact match is the source image')
     parser.add_argument('--prompt', type=str, default='Photograph of a cat on the grass', help='Prompt text for generation')
+    parser.add_argument('--source_prompt', type=str, default='', help='Prompt of the soruce image, leave blank for editing image or describe style that you want to transfer from source image')
     parser.add_argument('--dtype', type=str, default='bfloat16', choices=['float16', 'bfloat16', 'float32'], help='Data type for computations')
 
     #face of a boy with sunlight illuminate on the right
@@ -266,11 +268,14 @@ def main():
 
     # Encode image to latents
     img_latent = encode_imgs(img, pipe, DTYPE)
+
     if not args.no_inversion:
+        # Inversion to get the noise of input image in Guassian space
         inversed_latent = interpolated_inversion(
             pipe, 
             img_latent,
             gamma=args.gamma,
+            prompt=args.source_prompt,
             DTYPE=DTYPE,
             num_steps=args.num_steps,
             seed = args.seed
