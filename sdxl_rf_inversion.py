@@ -16,26 +16,29 @@ def decode_imgs(latents, pipeline):
     latents = 1 / pipeline.vae.config.scaling_factor * latents
     imgs = pipeline.vae.decode(latents)[0]
     
-    # Move to CPU and convert to float32 for numeric stability
+    # Move to CPU and convert to float32
     imgs = imgs.cpu().float()
     
-    # Normalize from [-1, 1] to [0, 1] with proper clamping
+    # Handle NaN values
+    imgs = torch.nan_to_num(imgs, nan=0.0, posinf=1.0, neginf=0.0)
+    
+    # Normalize from [-1, 1] to [0, 1]
     imgs = ((imgs + 1) / 2).clamp(0, 1)
     
-    # Scale to [0, 255]
-    imgs = (imgs * 255).round()
-    
-    # Convert to numpy and ensure values are in valid range
+    # Convert to numpy array with proper rounding
     imgs = imgs.numpy()
-    imgs = np.maximum(np.minimum(imgs, 255), 0)
+    imgs = np.floor(imgs * 255 + 0.5)
     
-    # Convert to uint8
-    imgs = imgs.astype(np.uint8)
+    # Ensure values are in valid range before uint8 conversion
+    imgs = np.clip(imgs, 0, 255)
+    
+    # Convert to uint8 after ensuring valid range
+    imgs = imgs.astype('uint8')
     
     # Rearrange dimensions
     imgs = np.transpose(imgs, (0, 2, 3, 1))
     
-    # Convert to PIL Image (return single image since we're processing one at a time)
+    # Convert to PIL Image
     return Image.fromarray(imgs[0])
 
 @torch.inference_mode()
@@ -79,27 +82,20 @@ def interpolated_denoise(
     num_steps=28,
     seed=42
 ):
-    timesteps, num_inference_steps = retrieve_timesteps(pipeline.scheduler, num_steps, pipeline.device)
+    # Set timesteps
+    pipeline.scheduler.set_timesteps(num_steps, device=pipeline.device)
+    timesteps = pipeline.scheduler.timesteps
     
     # Text conditioning
     do_classifier_free_guidance = guidance_scale > 1.0
     
-    if prompt == "":
-        prompt_embeds = negative_prompt_embeds = torch.zeros(
-            (1, 77, 2048), device=pipeline.device, dtype=DTYPE
-        )
-        pooled_prompt_embeds = negative_pooled_prompt_embeds = torch.zeros(
-            (1, 1280), device=pipeline.device, dtype=DTYPE
-        )
-    else:
-        prompt_embeds = pipeline._encode_prompt(
-            prompt=prompt,
-            device=pipeline.device,
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=do_classifier_free_guidance,
-            negative_prompt=negative_prompt,
-        )
-        prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = prompt_embeds
+    text_embeddings = pipeline.encode_prompt(
+        prompt=prompt,
+        device=pipeline.device,
+        num_images_per_prompt=1,
+        do_classifier_free_guidance=do_classifier_free_guidance,
+        negative_prompt=negative_prompt,
+    )
 
     if use_inversed_latents:
         latents = inversed_latents
@@ -107,8 +103,11 @@ def interpolated_denoise(
         set_seed(seed)
         latents = torch.randn_like(img_latents)
     
-    target_img = img_latents.clone().to(torch.float32)
+    target_img = img_latents.clone()
     eta_values = generate_eta_values(timesteps, start_step, end_step, eta_base, eta_trend)
+
+    # Scale the initial latents
+    latents = pipeline.scheduler.scale_model_input(latents, timesteps[0])
 
     with pipeline.progress_bar(total=num_steps) as progress_bar:
         for i, t in enumerate(timesteps):
@@ -117,28 +116,29 @@ def interpolated_denoise(
                 latent_model_input = torch.cat([latents] * 2)
             else:
                 latent_model_input = latents
-                
-            timestep = t.expand(latent_model_input.shape[0])
 
-            # Add time ids for SDXL - ensure they're on the correct device
+            # Scale the input for this timestep
+            latent_model_input = pipeline.scheduler.scale_model_input(latent_model_input, t)
+                
+            # Add time ids for SDXL
             add_time_ids = pipeline._get_add_time_ids(
                 original_size=(1024, 1024),
                 crops_coords_top_left=(0, 0),
                 target_size=(1024, 1024),
                 dtype=latents.dtype,
                 text_encoder_projection_dim=pipeline.text_encoder_2.config.projection_dim,
-            ).to(pipeline.device)  # Add this .to(pipeline.device)
+            ).to(pipeline.device)
 
             if do_classifier_free_guidance:
                 add_time_ids = add_time_ids.repeat(2, 1)
 
             # Predict the noise residual
-            pred_velocity = pipeline.unet(
+            noise_pred = pipeline.unet(
                 latent_model_input,
-                timestep,
-                encoder_hidden_states=torch.cat([negative_prompt_embeds, prompt_embeds]) if do_classifier_free_guidance else prompt_embeds,
+                t,
+                encoder_hidden_states=text_embeddings[0] if not do_classifier_free_guidance else torch.cat([text_embeddings[1], text_embeddings[0]]),
                 added_cond_kwargs={
-                    "text_embeds": torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds]) if do_classifier_free_guidance else pooled_prompt_embeds,
+                    "text_embeds": text_embeddings[2] if not do_classifier_free_guidance else torch.cat([text_embeddings[3], text_embeddings[2]]),
                     "time_ids": add_time_ids,
                 },
                 return_dict=False,
@@ -146,25 +146,24 @@ def interpolated_denoise(
 
             # Handle classifier free guidance
             if do_classifier_free_guidance:
-                noise_pred_uncond, noise_pred_text = pred_velocity.chunk(2)
-                pred_velocity = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-            # Prevents precision issues
-            latents = latents.to(torch.float32)
-            pred_velocity = pred_velocity.to(torch.float32)
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
             # Target image velocity
-            t_curr = t / pipeline.scheduler.config.num_train_timesteps
-            target_velocity = -(target_img - latents) / t_curr
+            target_velocity = -(target_img - latents) / pipeline.scheduler.sigmas[i]
 
-            # interpolated velocity
+            # Interpolated velocity
             eta = eta_values[i]
-            interpolate_velocity = pred_velocity + eta * (target_velocity - pred_velocity)
+            interpolate_velocity = noise_pred + eta * (target_velocity - noise_pred)
 
-            # denoising
-            latents = pipeline.scheduler.step(interpolate_velocity, t, latents, return_dict=False)[0]
+            # Denoising step
+            latents = pipeline.scheduler.step(
+                interpolate_velocity,
+                t,
+                latents,
+                return_dict=False,
+            )[0]
             
-            latents = latents.to(DTYPE)
             progress_bar.update()
     
     return latents
@@ -176,66 +175,74 @@ def interpolated_inversion(
     gamma,
     DTYPE,
     prompt="",
-    num_steps=28,
+    num_steps=50,
     seed=42
 ):
+    # Set up scheduler
     pipeline.scheduler.set_timesteps(num_steps, device=pipeline.device)
-
-    if not hasattr(pipeline.scheduler, "sigmas"):
-        raise Exception("Cannot find sigmas variable in scheduler. Please use FlowMatchEulerDiscreteScheduler for RF Inversion")
+    timesteps = pipeline.scheduler.timesteps
     
-    timesteps = pipeline.scheduler.sigmas
-    timesteps = torch.flip(timesteps, dims=[0])
+    # Get text embeddings
+    text_embeddings = pipeline.encode_prompt(
+        prompt=prompt,
+        device=pipeline.device,
+        num_images_per_prompt=1,
+        do_classifier_free_guidance=False,
+    )
 
-    # For inversion, generate empty embeddings - make sure they're on the correct device
-    empty_embeds = torch.zeros((1, 77, 2048), device=pipeline.device, dtype=DTYPE)
-    empty_pooled_embeds = torch.zeros((1, 1280), device=pipeline.device, dtype=DTYPE)
-
+    # Initialize noise
     set_seed(seed)
-    target_noise = torch.randn(latents.shape, device=latents.device, dtype=torch.float32)
+    target_noise = torch.randn_like(latents)
+    current_latents = latents.clone()
+
+    # Scale initial latents
+    current_latents = pipeline.scheduler.scale_model_input(current_latents, timesteps[0])
 
     with pipeline.progress_bar(total=len(timesteps)-1) as progress_bar:
-        for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
-            t_vec = torch.full((latents.shape[0],), t_curr * 1000, dtype=latents.dtype, device=latents.device)
-
-            # Add time ids for SDXL - ensure they're on the correct device
-            add_time_ids = pipeline._get_add_time_ids(
-                original_size=(1024, 1024),
-                crops_coords_top_left=(0, 0),
-                target_size=(1024, 1024),
-                dtype=latents.dtype,
-                text_encoder_projection_dim=pipeline.text_encoder_2.config.projection_dim,
-            ).to(pipeline.device)  # Add this .to(pipeline.device)
-
-            # Null-text velocity
-            pred_velocity = pipeline.unet(
-                latents,
-                t_vec,
-                encoder_hidden_states=empty_embeds,
+        for i, t in enumerate(timesteps[:-1]):
+            # Scale input for current timestep
+            model_input = pipeline.scheduler.scale_model_input(current_latents, t)
+            
+            # Get model prediction
+            noise_pred = pipeline.unet(
+                model_input,
+                t,
+                encoder_hidden_states=text_embeddings[0],
                 added_cond_kwargs={
-                    "text_embeds": empty_pooled_embeds,
-                    "time_ids": add_time_ids,
+                    "text_embeds": text_embeddings[2],
+                    "time_ids": pipeline._get_add_time_ids(
+                        original_size=(1024, 1024),
+                        crops_coords_top_left=(0, 0),
+                        target_size=(1024, 1024),
+                        dtype=model_input.dtype,
+                        text_encoder_projection_dim=pipeline.text_encoder_2.config.projection_dim,
+                    ).to(pipeline.device),
                 },
                 return_dict=False,
             )[0]
 
-            # Prevents precision issues
-            latents = latents.to(torch.float32)
-            pred_velocity = pred_velocity.to(torch.float32)
+            # Get target velocity for current timestep
+            sigma = pipeline.scheduler.sigmas[i]
+            target_velocity = (target_noise - current_latents) / sigma
 
-            # Target noise velocity
-            target_noise_velocity = (target_noise - latents) / (1.0 - t_curr)
+            # Interpolate between model prediction and target
+            interpolated_pred = (1 - gamma) * noise_pred + gamma * target_velocity
+
+            # Update latents
+            next_timestep = timesteps[i + 1]
+            current_latents = pipeline.scheduler.step(
+                interpolated_pred,
+                t,
+                current_latents,
+                return_dict=False,
+            )[0]
             
-            # interpolated velocity
-            interpolated_velocity = gamma * target_noise_velocity + (1 - gamma) * pred_velocity
-            
-            # one step Euler
-            latents = latents + (t_prev - t_curr) * interpolated_velocity
-            
-            latents = latents.to(DTYPE)
             progress_bar.update()
-            
-    return latents
+
+    return current_latents
+
+
+
 
 def main():
     parser = argparse.ArgumentParser(description='Test interpolated_denoise with SDXL.')
@@ -277,25 +284,19 @@ def main():
     ).to("cuda")
     
     # Set scheduler
-    pipe.scheduler = FlowMatchEulerDiscreteScheduler()
-
-    # Create output directory if not exists
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # Load and preprocess the image
     img = Image.open(args.image_path)
     transform = transforms.Compose([
-        transforms.Resize(1024, interpolation=transforms.InterpolationMode.BILINEAR),  # SDXL uses 1024x1024
+        transforms.Resize(1024, interpolation=transforms.InterpolationMode.BILINEAR),
         transforms.CenterCrop(1024),
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5]),
     ])
     
     img = transform(img).unsqueeze(0).to(pipe.device).to(DTYPE)
-
+    
     # Encode image to latents
     img_latent = encode_imgs(img, pipe, DTYPE)
-
+    
     if not args.no_inversion:
         inversed_latent = interpolated_inversion(
             pipe, 
