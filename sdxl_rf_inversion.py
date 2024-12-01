@@ -5,17 +5,38 @@ from PIL import Image
 from diffusers import DiffusionPipeline, EulerDiscreteScheduler, FlowMatchEulerDiscreteScheduler
 from torchvision import transforms
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import retrieve_timesteps
-
+import numpy as np
 def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
 @torch.inference_mode()
 def decode_imgs(latents, pipeline):
+    # Scale and decode with VAE
     latents = 1 / pipeline.vae.config.scaling_factor * latents
     imgs = pipeline.vae.decode(latents)[0]
-    imgs = pipeline.image_processor.postprocess(imgs, output_type="pil")
-    return imgs
+    
+    # Move to CPU and convert to float32 for numeric stability
+    imgs = imgs.cpu().float()
+    
+    # Normalize from [-1, 1] to [0, 1] with proper clamping
+    imgs = ((imgs + 1) / 2).clamp(0, 1)
+    
+    # Scale to [0, 255]
+    imgs = (imgs * 255).round()
+    
+    # Convert to numpy and ensure values are in valid range
+    imgs = imgs.numpy()
+    imgs = np.maximum(np.minimum(imgs, 255), 0)
+    
+    # Convert to uint8
+    imgs = imgs.astype(np.uint8)
+    
+    # Rearrange dimensions
+    imgs = np.transpose(imgs, (0, 2, 3, 1))
+    
+    # Convert to PIL Image (return single image since we're processing one at a time)
+    return Image.fromarray(imgs[0])
 
 @torch.inference_mode()
 def encode_imgs(imgs, pipeline, DTYPE):
@@ -306,7 +327,7 @@ def main():
     )
 
     # Decode latents to images
-    out = decode_imgs(img_latents, pipe)[0]
+    out = decode_imgs(img_latents, pipe)
 
     # Save output image
     output_filename = f"eta{args.eta_base}_{args.eta_trend}_start{args.start_step}_end{args.end_step}_inversed{not args.no_inversion}_guidance{args.guidance_scale}_seed{args.seed}.png"
