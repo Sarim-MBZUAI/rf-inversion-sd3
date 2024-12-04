@@ -207,7 +207,7 @@ def interpolated_inversion(
 
 def main():
     parser = argparse.ArgumentParser(description='Process multiple images with interpolated_denoise.')
-    parser.add_argument('--model_path', type=str, default='/sharhf_XFvlNZEhYBNdsNgUwapIncKkbydznRbMIthf_XFvlNZEhYBNdsNgUwapIncKkbydznRbMIthf_XFvlNZEhYBNdsNgUwapIncKkbydznRbMIthf_XFvlNZEhYBNdsNgUwapIncKkbydznRbMIted/shashmi/stable-diffusion-2', help='Path to the pretrained model')
+    parser.add_argument('--model_path', type=str, default='/shared/shashmi/stable-diffusion-2', help='Path to the pretrained model')
     parser.add_argument('--input_dir', type=str, required=True, help='Directory containing input images')
     parser.add_argument('--output_dir', type=str, default='output', help='Directory to save output images')
     parser.add_argument('--eta_base', type=float, default=0.95, help='Eta parameter for interpolated_denoise')

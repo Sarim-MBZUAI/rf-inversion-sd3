@@ -1,0 +1,38 @@
+=== Numerical Results ===
+
+
+PSNR Statistics:
+Fake vs Inv_Fake:
+  Mean: 19.5514
+  Std:  2.7448
+  Min:  12.0515
+  Max:  31.1780
+Real vs Inv_Real:
+  Mean: 14.1615
+  Std:  3.2672
+  Min:  8.0533
+  Max:  33.4152
+
+SSIM Statistics:
+Fake vs Inv_Fake:
+  Mean: 0.5432
+  Std:  0.1674
+  Min:  0.1021
+  Max:  0.9321
+Real vs Inv_Real:
+  Mean: 0.4303
+  Std:  0.1907
+  Min:  0.0539
+  Max:  0.9818
+
+LPIPS Statistics:
+Fake vs Inv_Fake:
+  Mean: 0.2222
+  Std:  0.0758
+  Min:  0.0309
+  Max:  0.5653
+Real vs Inv_Real:
+  Mean: 0.3955
+  Std:  0.0792
+  Min:  0.0659
+  Max:  0.6970
